@@ -1,0 +1,230 @@
+[project]
+name = "pytest-alembic"
+version = "0.13.2"
+description = "A pytest plugin for verifying alembic migrations."
+authors = [{ name = "Dan Cardin", email = "ddcardin@gmail.com" }]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["pytest", "sqlalchemy", "alembic", "migration", "revision"]
+classifiers = [
+    "Framework :: Pytest",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pytest>=7.0", "alembic>=1.9", "sqlalchemy>=1.4"]
+
+[project.urls]
+repository = "https://github.com/schireson/pytest-alembic"
+
+[project.entry-points.pytest11]
+pytest_alembic = "pytest_alembic.plugin"
+
+[build-system]
+requires = ["uv_build>=0.6,<0.13"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "asyncpg>=0.30",
+    "coverage[toml]>=6.4.4",
+    "deptry>=0.20",
+    "greenlet>=3.1",
+    "interrogate>=1.7",
+    "mypy>=1.11",
+    "psycopg2-binary>=2.9.10",
+    "pyflakes>=3.4.0",
+    "pytest-mock-resources[docker]>=2.13.0",
+    "ruff>=0.15.0",
+]
+# The two packages CI needs and nothing else does. Declared here rather than installed
+# ad hoc in the workflow so they resolve from `uv.lock`, are covered by `make audit-all`,
+# and are visible to dependabot -- a `pip install coveralls` in a `run:` step let a
+# coveralls release change what CI ran with no commit to this repo.
+ci = ["coveralls>=4.0", "tomli>=2.0"]
+docs = [
+    "myst-parser>=2.0",
+    "sphinx>=7.0",
+    "sphinx-autobuild>=2024.2.4",
+    "sphinx-autodoc-typehints>=2.0",
+    "sphinx-rtd-theme>=2.0",
+    "sphinx-pyproject>=0.3",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# The ratchet has reached the top, like [tool.interrogate] below: every statement
+# and every branch under `src` is executed by the suite, so the floor is the measured
+# number. A 100% floor is the only one that cannot silently erode -- anything less
+# lets a new untested path hide inside the slack.
+#
+# The previous floor of 93 was set because the CI matrix skipped the asyncio tests on
+# sqlalchemy versions without asyncio support. That reason is gone: every matrix entry
+# pins some 2.x (2.0.52 across the python sweep, 2.0.40 on the older-pytest rows), so
+# `requires_asyncio_support` never skips and no entry drops those tests.
+#
+# Each matrix entry enforces this on its own -- `make test` runs the report per job --
+# so what is excluded below has to be excluded for *every* entry, not just this one.
+# `branch = true` under [tool.coverage.run] means partial branches count too.
+fail_under = 100
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "if __name__ == .__main__.:"]
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "I",
+    "N",
+    "Q",
+    "S",
+    "T",
+    "W",
+    "ARG",
+    "BLE",
+    "DJ",
+    "DTZ",
+    "EM",
+    "ERA",
+    "EXE",
+    "FBT",
+    "ICN",
+    "INP",
+    "ISC",
+    "NPY",
+    "PD",
+    "PGH",
+    "PIE",
+    "PT",
+    "PTH",
+    "PYI",
+    "RET",
+    "RSE",
+    "RUF",
+    "SIM",
+    "SLF",
+    "TCH",
+    "TID",
+    "TRY",
+    "UP",
+    "YTT",
+]
+ignore = ["E501", "S101", "D1", "B904", "B007", "B904"]
+
+[tool.ruff.lint.isort]
+order-by-type = false
+
+[tool.ruff.lint.per-file-ignores]
+"src/pytest_alembic/tests/**/*.py" = ["S101", "BLE001"]
+"**/tests/**/*.py" = ["D", "S", "N801", "N802", "N806", "T201", "E501"]
+"examples/**/*.py" = ["INP001", "A", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+parallel = true
+
+[tool.pytest.ini_options]
+doctest_optionflags = "NORMALIZE_WHITESPACE IGNORE_EXCEPTION_DETAIL ELLIPSIS"
+addopts = "--doctest-modules -vv --ff --strict-markers"
+pytest_alembic_exclude = 'up_down_consistency'
+norecursedirs = ".* build dist *.egg"
+pytester_example_dir = "examples"
+# Applied automatically by `pytest_collection_modifyitems` in tests/conftest.py -- never
+# by hand, so it cannot drift out of step with what the examples actually use. It exists
+# so the non-Linux CI job can deselect the tests that need a real postgres: GitHub
+# supports service containers on Linux runners only.
+markers = ["postgres: needs a reachable postgres; deselected on runners that have none"]
+filterwarnings = [
+    "error",
+    "default:.*which short-circuited the downgrade operation and may have passed the test.*:UserWarning",
+    "ignore:unclosed <socket.socket.*:ResourceWarning",
+    "ignore:unclosed transport.*:ResourceWarning",
+    "ignore:unclosed connection.*:ResourceWarning",
+    "ignore:pkg_resources is deprecated as an API:DeprecationWarning",
+    "ignore:.*is deprecated and will be removed in Python 3.14.*:DeprecationWarning",
+]
+
+[tool.mypy]
+strict_optional = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+incremental = true
+
+# Without this, a function carrying no annotations at all is not checked -- it is
+# *skipped*, so a clean `mypy src tests` says nothing about its body. Every definition
+# under `src` and `tests` is annotated, so this is a 100% floor rather than a ratchet,
+# like [tool.interrogate] below: a new unannotated function fails the build.
+#
+# `ignore_missing_imports` stays. Dropping it would demand stubs for the handful of
+# dependencies that ship none, which is a separate and much larger project; alembic,
+# sqlalchemy, pytest and pytest_mock_resources all ship `py.typed`, so the annotations
+# here are checked against their real signatures either way.
+disallow_untyped_defs = true
+
+[tool.deptry]
+# Dependency hygiene, as a gate. Runs over `src` only: the dev and docs groups exist to
+# support the test suite and the docs build, which deptry would otherwise report as
+# unused because nothing under `src` imports them.
+
+[tool.deptry.per_rule_ignores]
+# DEP004 is "imported but declared as a dev dependency", and here that is deliberate.
+# `collect_clean_alembic_environment` is executed as a subprocess by the experimental
+# `all_models_register_on_metadata` test, and imports coverage only under
+# `if __name__ == "__main__"`, behind a `COVERAGE_PROCESS_START` environment check, so
+# that the subprocess's lines are measured when the suite runs under coverage. It is
+# never reached by a user of this package, so coverage stays a dev dependency.
+DEP004 = ["coverage"]
+
+[tool.interrogate]
+# Docstring *coverage*, as a ratchet. This deliberately complements ruff rather
+# than duplicating it: `D1` is ignored under [tool.ruff.lint], so no individual
+# symbol is required to carry a docstring, while this floor stops the overall
+# proportion from regressing. Public API first, internals as they are touched.
+#
+# The ratchet has reached the top: every symbol interrogate counts is documented,
+# so the floor is the measured number. A new undocumented helper now fails the
+# build, which is the point — a 100% floor is the only one that cannot silently
+# erode, and the exclusions below define what "counts" narrowly enough that
+# meeting it does not mean writing docstrings for `__repr__`.
+fail-under = 100
+
+# Re-export modules (`__init__.py`) hold only imports and `__all__`; magic
+# methods and nested helpers are not a documentation surface. `ignore-init-method`
+# is intentionally absent: it is mutually exclusive with `style = "google"`, where
+# the class docstring is what documents `__init__`.
+ignore-init-module = true
+ignore-magic = true
+ignore-nested-functions = true
+ignore-private = true
+ignore-semiprivate = true
+
+# Note: ignore-property-decorators / ignore-setters / ignore-overloaded-functions
+# are deliberately left off — this project's properties *are* documented, so
+# excluding them would drop them from the numerator and lower the score.
+
+# Honour the google convention already configured in [tool.ruff.lint.pydocstyle].
+style = "google"
+
+exclude = ["tests", "examples", "docs", "build", "dist", ".venv"]
+omit-covered-files = false
+verbose = 1

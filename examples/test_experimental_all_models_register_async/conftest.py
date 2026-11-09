@@ -1,0 +1,33 @@
+import pytest
+from pytest_mock_resources import create_postgres_fixture
+from sqlalchemy.engine.url import URL
+from sqlalchemy.ext.asyncio import create_async_engine
+
+import pytest_alembic.tests.experimental
+
+pg = create_postgres_fixture()
+
+
+@pytest.fixture
+def alembic_engine(pg):
+    creds = pg.pmr_credentials
+    url = URL.create(
+        drivername="postgresql+asyncpg",
+        username=creds.username,
+        password=creds.password,
+        host=creds.host,
+        port=creds.port,
+        database=creds.database,
+    )
+    return create_async_engine(url)
+
+
+@pytest.fixture
+def alembic_config():
+    return {"before_revision_data": {"bbbbbbbbbbbb": {"__tablename__": "foo", "id": 9}}}
+
+
+def test_all_models_register_on_metadata(alembic_runner):
+    pytest_alembic.tests.experimental.test_all_models_register_on_metadata(
+        alembic_runner, "models", async_=True
+    )

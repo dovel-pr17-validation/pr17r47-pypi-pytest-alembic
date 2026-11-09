@@ -1,0 +1,307 @@
+name: CI
+on:
+  # Branches only. Tag pushes reach this workflow through release.yml, which
+  # calls it via workflow_call so that publishing waits on a green matrix; a
+  # bare `push:` would additionally run the matrix a second time on the tag.
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_call:
+    inputs:
+      working-directory:
+        # Already referenced by the Coveralls flag name below. Declared with an
+        # empty default so the reference stays valid now that this workflow has
+        # a real input schema, and resolves to the same value it always did.
+        description: Optional label fragment for the Coveralls flag name.
+        type: string
+        required: false
+        default: ""
+
+# Least privilege for every job below. A pinned action is only half the answer:
+# pinning fixes *which* third-party code runs, this fixes what that code is
+# allowed to do. Nothing in this workflow writes to the repository — the tests
+# read the tree, and Coveralls uses GITHUB_TOKEN only to identify the build — so
+# read is the whole requirement. The release workflow grants its own narrower
+# writes on the jobs that need them.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    services:
+      postgres:
+        image: postgres:11.12
+        env:
+          POSTGRES_DB: dev
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    runs-on: ubuntu-latest
+    env:
+      UV_NO_SYNC: "1"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Sweep across python version sweep with the highest checked dependency version.
+          # Older pytest versions are tested separately below on a single interpreter
+          # since we have no reason to believe interpreter-specific breakage would
+          # surface in those older versions but not in pytest 9,
+          # but we **do** know that newer versions of dependencies may not support arbitrarily old
+          # python versions.
+          - {python-version: "3.10", pytest-version: "9.2.0", sqlalchemy-version: "2.0.52"}
+          - {python-version: "3.11", pytest-version: "9.2.0", sqlalchemy-version: "2.0.52"}
+          - {python-version: "3.12", pytest-version: "9.2.0", sqlalchemy-version: "2.0.52"}
+          - {python-version: "3.13", pytest-version: "9.2.0", sqlalchemy-version: "2.0.52"}
+          - {python-version: "3.14", pytest-version: "9.2.0", sqlalchemy-version: "2.0.52"}
+          - {python-version: "3.15", pytest-version: "9.2.0", sqlalchemy-version: "2.0.52"}
+
+          # For older tool versions, we can just stick to a single python version, again, because we
+          # have no reason to believe their pytest-alembic specifically impacts their compatibility.
+          # 7.0.0 is the floor declared in [project.dependencies]; 8.3.5 covers the
+          # intervening major, whose hook API differs from both neighbours. 9.1.1 is the
+          # last release before pytest 9.2 replaced the stored node id string with NodeId.
+          - {python-version: "3.13", pytest-version: "7.0.0", sqlalchemy-version: "2.0.40"}
+          - {python-version: "3.13", pytest-version: "8.3.5", sqlalchemy-version: "2.0.40"}
+          - {python-version: "3.13", pytest-version: "9.1.1", sqlalchemy-version: "2.0.40"}
+
+          # The sqlalchemy range, for the same reason and by the same logic. `lowest-deps`
+          # covers the 1.4 floor and the rows above cover two adjacent 2.0 patches, which
+          # left the end of the 1.4 series and the 2.0.0 boundary gated by nothing.
+          # alembic 1.20 requires sqlalchemy>=2.0, and `uv pip install sqlalchemy==...` does not
+          # re-resolve the already-installed alembic, so the 1.4 row pins a compatible one.
+          - {python-version: "3.13", pytest-version: "9.2.0", sqlalchemy-version: "1.4.54", alembic-requirement: "alembic<1.20"}
+          - {python-version: "3.11", pytest-version: "9.2.0", sqlalchemy-version: "2.0.0"}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Install specific versions
+        # `==`, not `~=`. `sqlalchemy~=2.0.40` means ">=2.0.40, ==2.0.*", which the
+        # already-installed newest 2.0.x satisfies -- so the step emitted no install
+        # line at all and the column never varied anything. A pin that logs nothing is
+        # the tell; a real one logs `- x==a` / `+ x==b`.
+        run: |
+          uv pip install 'sqlalchemy==${{ matrix.sqlalchemy-version }}'
+          uv pip install 'pytest==${{ matrix.pytest-version }}'
+
+      - name: Install specific alembic
+        if: matrix.alembic-requirement
+        run: uv pip install '${{ matrix.alembic-requirement }}'
+
+      - name: Run linters
+        run: make lint
+
+      - name: Run tests
+        run: make test
+
+      - name: Store test result artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ runner.os }}-${{ matrix.python-version }}-${{ matrix.pytest-version }}-${{ matrix.sqlalchemy-version }}
+          path: coverage.xml
+
+      - name: Coveralls
+        env:
+          COVERALLS_FLAG_NAME: run-${{ inputs.working-directory }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COVERALLS_PARALLEL: true
+        run: |
+          # Install the CI deps without disturbing the
+          # version pins from earlier steps due to UV_NO_SYNC.
+          uv sync --frozen --inexact --only-group ci
+          uv run coveralls --service=github
+
+  audit:
+    # Dependency vulnerability scan. Deliberately outside the test matrix and
+    # with no `needs:` — the lockfile is identical for every matrix entry, so
+    # auditing it 20 times would report the same answer 20 times.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+
+      - name: Audit runtime dependencies
+        run: make audit
+
+      - name: Audit dev and docs dependencies
+        # Gating, not informational. This was `continue-on-error` while the docs group
+        # reached mistune 0.8.4 through m2r2, which pinned it exactly and so could not be
+        # resolved. m2r2 has been replaced by myst-parser, the whole lockfile is clean,
+        # and a new advisory in the dev or docs groups should fail the build rather than
+        # be reported into a log nobody reads.
+        run: make audit-all
+
+  pre-commit:
+    # The hook config, as a gate. A `.pre-commit-config.yaml` no job invokes is a file
+    # rather than a gate -- it rots silently, and the first person to run
+    # `pre-commit install` finds out. Outside the test matrix for the reason `audit`
+    # and `docs-coverage` document below: the answer does not vary by matrix entry.
+    #
+    # This deliberately overlaps `make lint`, which is the check-only form of the same
+    # tools and gates every matrix entry. What is verified here is that the hooks
+    # themselves still resolve and run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run the pre-commit hooks
+        run: uvx pre-commit run --all-files --show-diff-on-failure
+
+  docs-coverage:
+    # Docstring coverage. Outside the test matrix for the same reason the audit job
+    # documents above: the answer is identical for every matrix entry, so running it
+    # 20 times would report the same number 20 times. Unlike `audit`, this one needs
+    # the dev group installed, since interrogate is a declared dependency rather than
+    # a `uvx` download.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Check docstring coverage
+        run: make docs-coverage
+
+  deps:
+    # Dependency hygiene: an import with no declaration, or a declaration with no
+    # import. Outside the test matrix for the reason `audit` and `docs-coverage`
+    # document above -- the answer comes from `pyproject.toml` and `src`, neither of
+    # which varies by matrix entry.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Check dependency hygiene
+        run: make deps
+
+  lowest-deps:
+    # The declared dependency floors, as a gate. `--resolution lowest-direct` pins every
+    # *direct* dependency to the minimum its specifier allows, so this job is the only
+    # thing that distinguishes a floor the project has verified from a number somebody
+    # typed. Outside the test matrix for the reason `audit` and `docs-coverage` document
+    # above: the resolution comes from `pyproject.toml`, which does not vary by entry.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install the project at its declared floors
+        run: uv sync --all-groups --resolution lowest-direct
+
+      - name: Run the suite at the declared floors
+        # Not `make test`: that runs under coverage against the 100% floor.
+        run: uv run --all-groups --resolution lowest-direct pytest src tests -q
+
+  cross-platform:
+    # We have a couple of potentially OS dependent code paths (path manipulation and
+    # subprocess calls). Our reliance on the postgres service for tests is incompatible with
+    # macos/windows, so we instead just run the test subsets which do not rely on a database.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run the tests that need no database
+        run: uv run pytest src tests -m "not postgres" -q
+
+  docs:
+    # The documentation build, as a gate. Outside the test matrix for the same
+    # reason `audit` and `docs-coverage` document above: the .rst sources do not
+    # vary by matrix entry. Until this existed, the only thing that ever built
+    # these docs was readthedocs, *after* the merge — so a broken cross-reference
+    # was reported by a third-party service in a post-merge email rather than by
+    # the pull request that introduced it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Build the documentation
+        run: make docs
+
+  finish:
+    needs:
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout and uv, which this job did not need while it installed coveralls with a
+      # bare `pip install`: the lockfile has to be present for the pin to mean anything.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Coveralls Finished
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          uv sync --frozen --only-group ci
+          uv run --no-sync coveralls --service=github --finish

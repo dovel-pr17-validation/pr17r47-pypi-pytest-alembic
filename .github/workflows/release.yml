@@ -1,0 +1,53 @@
+name: Github Release/Publish PyPi
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Read by default, including for the `test` job's call into build.yml, which a
+# reusable workflow can never exceed. `gh-release` re-grants the one write this
+# workflow actually needs, on the single job that needs it.
+permissions:
+  contents: read
+
+jobs:
+  # Run the full CI matrix for the tagged commit before anything is published.
+  # `needs: test` below is what makes this a gate: a tag pushed onto a commit
+  # whose tests fail stops here, having released nothing.
+  #
+  # No `secrets: inherit` — the called workflow only uses GITHUB_TOKEN, which is
+  # provided automatically, so PYPI_TOKEN stays scoped to the publish job.
+  test:
+    uses: ./.github/workflows/build.yml
+
+  gh-release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading its assets is a write to this
+      # repository; no other job here gets one.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+
+  publish-pypi:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+
+      - name: Publish
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          uv build
+          uv publish --token "$PYPI_TOKEN"
